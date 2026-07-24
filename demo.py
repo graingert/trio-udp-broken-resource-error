@@ -25,11 +25,21 @@ async def main() -> None:
             with anyio.fail_after(2):
                 await udp.receive()
         except TimeoutError:
-            pass
+            print("timeout out correctly 1")
         except anyio.BrokenResourceError as e:
             errors.append(e)
         else:
-            raise AssertionError("did no timeout")
+            errors.append(AssertionError("did not timeout"))
+
+        try:
+            with anyio.fail_after(2):
+                await udp.receive()
+        except TimeoutError:
+            print("timeout out correctly 2")
+        except anyio.BrokenResourceError as e:
+            errors.append(e)
+        else:
+            errors.append(AssertionError("did not timeout"))
 
         local_host, local_port = udp.extra(SocketAttribute.local_address)
 

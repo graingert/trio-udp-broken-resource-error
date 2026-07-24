@@ -10,19 +10,18 @@ fully usable.
 
 The two backends handle this differently:
 
-- **asyncio backend**: the ICMP error is delivered to `DatagramProtocol.error_received`,
-  which stores it but never wakes a pending `receive()`. The error is effectively
-  ignored and reads continue.
+- **asyncio backend**: the ICMP error is delivered to `DatagramProtocol.error_received`.
+  `receive()` later raises `BrokenResourceError` from the stored exception.
 - **trio backend**: `recvfrom()` raises `ConnectionResetError`, which
   `_convert_socket_error` turns into `anyio.BrokenResourceError`, propagating straight
   out of `UDPSocket.receive()`.
 
-So the same code, on the same OS, behaves differently depending on the backend. On
-trio it surfaces as `BrokenResourceError` — which by anyio's own contract signals a
-permanently unusable resource — even though the socket is fine and the very next
-`receive()` succeeds. A datagram server that serves many peers off one socket has no
-robust, portable way to tell "one peer's datagram bounced, keep going" from "the
-socket is genuinely broken."
+So the same underlying socket condition surfaces as `BrokenResourceError` on both
+backends. The problem is that by anyio's own contract this signals a permanently
+unusable resource, even though the socket is fine and the very next `receive()`
+succeeds. A datagram server that serves many peers off one socket has no robust,
+portable way to tell "one peer's datagram bounced, keep going" from "the socket is
+genuinely broken."
 
 ### Environment
 
@@ -89,11 +88,21 @@ async def main() -> None:
             with anyio.fail_after(2):
                 await udp.receive()
         except TimeoutError:
-            pass
+            print("timeout out correctly 1")
         except anyio.BrokenResourceError as e:
             errors.append(e)
         else:
-            raise AssertionError("did no timeout")
+            errors.append(AssertionError("did not timeout"))
+
+        try:
+            with anyio.fail_after(2):
+                await udp.receive()
+        except TimeoutError:
+            print("timeout out correctly 2")
+        except anyio.BrokenResourceError as e:
+            errors.append(e)
+        else:
+            errors.append(AssertionError("did not timeout"))
 
         local_host, local_port = udp.extra(SocketAttribute.local_address)
 
@@ -120,7 +129,6 @@ async def main() -> None:
 
 
 anyio.run(main, backend="trio")   # vs. backend="asyncio"
-
 ```
 
 Run with `backend="trio"` → `BrokenResourceError`.
@@ -133,7 +141,7 @@ Run with `backend="asyncio"` → the error is swallowed; `fail_after` times out 
 ```python
 class DatagramProtocol(asyncio.DatagramProtocol):
     def error_received(self, exc: Exception) -> None:
-        self.exception = exc                     # stored, but nothing is woken
+        self.exception = exc
 
 class UDPSocket(abc.UDPSocket):
     async def receive(self) -> tuple[bytes, IPSockAddrType]:
@@ -141,15 +149,16 @@ class UDPSocket(abc.UDPSocket):
             ...
             if not self._protocol.read_queue and not self._transport.is_closing():
                 self._protocol.read_event.clear()
-                await self._protocol.read_event.wait()   # ICMP error never sets this
+                await self._protocol.read_event.wait()
             try:
                 return self._protocol.read_queue.popleft()
             except IndexError:
-                ...                                       # only raises on transport close
+                if self._protocol.exception is not None:
+                    raise BrokenResourceError from self._protocol.exception
+                ...
 ```
 
-For an unconnected `UDPSocket`, `receive()` never consults `self._protocol.exception`,
-so an ICMP error is ignored.
+So asyncio converts the deferred datagram error into `BrokenResourceError` too.
 
 **trio** — `_backends/_trio.py`:
 
@@ -179,28 +188,20 @@ than a genuine one.
 
 ### Expected behavior
 
-`UDPSocket.receive()` should behave consistently across backends. Since the asyncio
-backend already ignores ICMP errors on an unconnected UDP socket, the trio backend
-should do the same rather than raising `BrokenResourceError` for a transient,
-per-datagram `WSAECONNRESET`.
+`UDPSocket.receive()` should not raise `BrokenResourceError` for a transient,
+per-datagram `WSAECONNRESET` on an otherwise usable UDP socket.
 
 ### Possible fixes
 
-1. **Ignore it in `receive()` (matches the asyncio backend).** In the trio backend's
-   `UDPSocket.receive()` (and `UNIXDatagramSocket.receive()`), when `recvfrom()` raises
-   `ConnectionResetError` on Windows, loop and read the next datagram instead of
-   converting to `BrokenResourceError`. The error is a one-shot notification, so the
-   retry blocks for real traffic rather than spinning.
+1. **Ignore Windows UDP port-unreachable in `receive()`.** In both backends, when an
+   unconnected UDP socket hits Windows `WSAECONNRESET` / `ConnectionResetError`, treat
+   it as a one-shot datagram notification and continue waiting for the next real
+   datagram instead of converting it to `BrokenResourceError`.
 
-2. **Fix it at the root with `SIO_UDP_CONNRESET`.** On Windows, clear the
-   `SIO_UDP_CONNRESET` behavior at socket creation
-   (`sock.ioctl(socket.SIO_UDP_CONNRESET, False)`), so `recvfrom()` never reports
-   `WSAECONNRESET` in the first place. This is the standard remedy other networking
-   stacks apply and would make both backends consistent without special-casing
-   `receive()`.
-
-Option 2 is the cleaner root-cause fix; option 1 mirrors what the asyncio backend
-effectively already does.
+2. **Filter it before it becomes a resource-level error.** In asyncio, that means not
+   turning the exception captured by `error_received()` into `BrokenResourceError` for
+   this specific case. In trio, that means not routing this `ConnectionResetError`
+   through `_convert_socket_error()` as a fatal socket failure.
 
 ### Workaround (for reference)
 
